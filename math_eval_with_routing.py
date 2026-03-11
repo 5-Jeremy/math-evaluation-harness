@@ -9,6 +9,11 @@ from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from codeGen_curriculum.verl_teacher.verl_teacher.workers.config.teacher import FSDPTeacherConfig, FSDPTeacherModelCfg
+from verl.workers.config.optimizer import FSDPOptimizerConfig
+from verl.workers.config.engine import FSDPEngineConfig
+from verl.utils.tokenizer import hf_tokenizer
+from verl_teacher.verl_teacher.workers.fsdp_workers import TeacherScoreWorker
 from evaluate import evaluate
 from utils import set_seed, load_jsonl, save_jsonl, construct_prompt
 from parser import *
@@ -17,6 +22,12 @@ from data_loader import load_data
 from python_executor import PythonExecutor
 from model_utils import load_hf_lm_and_tokenizer, generate_completions
 import csv
+
+# I am hard-coding the prompt here (which corresponds with the simple-rl prompt) because it is important for the
+# router to see the exact same prompt format it was trained with
+def construct_prompt_custom(example, data_name, args):
+    full_prompt = "<|im_start|>system\nPlease reason step by step, and put your final answer within \\boxed{}.<|im_end|>\n<|im_start|>user\n" + example['question'] + "\n<|im_end|>\n<|im_start|>assistant\n"
+    return full_prompt
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -85,6 +96,29 @@ def prepare_data(data_name, args):
 
 
 def setup(args):
+    data_list = args.data_names.split(',')
+    # load router
+    # rank = torch.distributed.get_rank()
+    model_path = args.model_path.rstrip("/")
+    config = FSDPTeacherConfig(
+        strategy="fsdp2",
+        forward_micro_batch_size_per_gpu=64, # This should be as high as feasible
+        use_dynamic_bsz=False,
+        ulysses_sequence_parallel_size=1,
+        rollout_n=1,
+        model=FSDPTeacherModelCfg(
+            path=model_path,
+            tokenizer_path=model_path,
+            fsdp_config=FSDPEngineConfig(fsdp_size=-1),
+            use_remove_padding=False,
+            use_mean_pooling=False,
+        ),
+    )
+    tokenizer = hf_tokenizer(model_path, trust_remote_code=False)
+    worker = TeacherScoreWorker(config)
+    worker.init_model()
+    breakpoint()
+
     # load model
     available_gpus = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
     if args.use_vllm:
@@ -99,7 +133,6 @@ def setup(args):
             )
 
     # infer & eval
-    data_list = args.data_names.split(',')
     results = []
     for data_name in data_list:
         results.append(main(llm, tokenizer, data_name, args))
@@ -128,6 +161,8 @@ def setup(args):
     
     print(f"Results saved to {csv_path}")
 
+def make_routing_decisions(args):
+    pass
 
 def main(llm, tokenizer, data_name, args):
     examples, processed_samples, out_file = prepare_data(data_name, args)
@@ -149,7 +184,7 @@ def main(llm, tokenizer, data_name, args):
         # parse question and answer
         example['question'] = parse_question(example, data_name)
         gt_cot, gt_ans = parse_ground_truth(example, data_name)
-        full_prompt = construct_prompt(example, data_name, args)
+        full_prompt = construct_prompt_custom(example, data_name, args)
 
         if idx == args.start:
             print("full_prompt:", full_prompt)
